@@ -3,6 +3,8 @@ import pandas as pd
 from functools import wraps
 from time import time
 import matplotlib.mlab as mlab
+import scipy
+from scipy.stats import norm
 import math
 import matplotlib.pyplot as plt
 
@@ -49,19 +51,24 @@ def plot_multi(data, xlabel, cols=None, spacing=.1, **kwargs):
     ax.grid(color='k', linestyle='--', linewidth=1)
     ax.set_xlabel(xlabel=xlabel)
     return ax
-
-def norm_dist_test(y, label):
-    mu = np.mean(y)
-    sigma = np.std(y)
-    x = np.linspace(mu - 5*sigma, mu + 5*sigma, 100)
-    plt.figure(figsize=(12,5))
-    plt.plot(x,mlab.normpdf(x, mu, sigma), label='Normal')
-    plt.hist(y, density=True, bins=30, label=label)
-    plt.grid()
-    plt.legend()
-    plt.title('Normal vs. Test Distribution')
-    plt.show()
+ 
     
+def norm_dist_test(data, label):
+    # Fit a normal distribution to the data
+    mu, std = norm.fit(data)
+    
+    # Plot the histogram.
+    plt.hist(data, bins=100, density=True, alpha=0.6, label=[label])
+    
+    # Plot the PDF
+    # xmin, xmax = plt.xlim()
+    x = np.linspace(mu - 4*std, mu + 4*std, 100)
+    p = norm.pdf(x, mu, std)
+    plt.plot(x, p, linewidth=2, label=label+' PDF')
+    plt.legend()
+    
+    
+
 class Model:
     def __init__(self):
         self.y_pred = None
@@ -394,3 +401,12 @@ def validate_topics(docs, top_words,top_topic_num, NLP_algo, random_topic_num = 
     print()
     print('Article 3:')
     print(random_topic['Content'].iloc[np.random.randint(0,random_topic.shape[0])])
+    
+def norm_pdf(y):
+    mu = np.mean(y)
+    sigma = np.std(y)
+    x = np.linspace(mu - 6*sigma, mu + 6*sigma, 100)
+
+    np.random.seed(12)
+    norm_pdf = scipy.stats.norm.pdf(x, mu, sigma)
+    return norm_pdf    
