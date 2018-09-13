@@ -17,6 +17,8 @@ from sklearn.decomposition import NMF, LatentDirichletAllocation
 from textblob import TextBlob, Blobber
 from textblob.sentiments import NaiveBayesAnalyzer
 
+from pyramid.arima import auto_arima, ARIMA
+
 def plot_multi(data, xlabel, cols=None, spacing=.1, **kwargs):
 
     from pandas import plotting
@@ -191,19 +193,19 @@ class myNLP:
         self.top_5_topics_NMF = np.array(top_5_topics).T
             
         # get top 20 words for each topic
-        top_20_stem_words_NMF = []
+        self.top_20_stem_words_NMF = []
         topics = self.nmf.components_
         for n in range(topics.shape[0]):
             idx = topics[n].argsort()[::-1][:20]
             top_20_words_n = []
             for i in idx:
                 top_20_words_n.append(self.tfidf_feature_names[i])
-            top_20_stem_words_NMF.append(top_20_words_n)
-        self.top_words_in_topic_NMF = pd.DataFrame()
-        self.top_words_in_topic_NMF['top_20_stem_words (NMF)'] = ' '.join(top_20_stem_words_NMF)
+            self.top_20_stem_words_NMF.append(top_20_words_n)
         
         
-        return self.top_5_topics_NMF, self.top_words_in_topic_NMF, self.nmf, self.tfidf, self.tfidf_vect
+        
+        
+        return self.top_5_topics_NMF, self.top_20_stem_words_NMF, self.nmf, self.tfidf, self.tfidf_vect
     
     
     def fit_lda(self, docs):
@@ -228,18 +230,16 @@ class myNLP:
         self.top_5_topics_NMF = np.array(top_5_topics).T
         
         # get top 20 words for each topic
-        top_20_stem_words_LDA = []
+        self.top_20_stem_words_LDA = []
         topics = self.lda.components_
         for n in range(topics.shape[0]):
             idx = topics[n].argsort()[::-1][:20]
             top_20_words_n = []
             for i in idx:
                 top_20_words_n.append(self.tf_feature_names[i])
-            top_20_stem_words_LDA.append(top_20_words_n)
-        self.top_words_in_topic_LDA = pd.DataFrame()
-        self.top_words_in_topic_LDA['top_20_stem_words (LDA)'] = ' '.join(top_20_stem_words_LDA)
+            self.top_20_stem_words_LDA.append(top_20_words_n)
         
-        return self.top_5_topics_LDA, self.top_words_in_topic_LDA, self.lda, self.tf, self.cnt_vect
+        return self.top_5_topics_LDA, self.top_20_stem_words_NMF, self.lda, self.tf, self.cnt_vect
         
 
 def merge_2_string_lists(string_list1, string_list2):
@@ -292,11 +292,105 @@ def get_sentiment(text):
     tb = Blobber(text, analyzer=NaiveBayesAnalyzer())
     return opinion.sentiment.p_pos, opinion.polarity, opinion.subjectivity
 
-def add_top_5_topics(docs_pddf, top_5_topics):
+def add_top_5_topics(df, top_5_topics, NLP_algo_name):
     '''
     Adds top 5 topics in separate columns to the `docs` dataframe.
     '''
     for i, n in enumerate(range(1,6)):
-        col_name = 'Top #{} topic (NMF)'.format(str(n))
-        docs_pddf[col_name] = top_5_topics[i]
-    return docs_pddf
+        col_name = 'Top #{} topic ({})'.format(str(n),NLP_algo_name)
+        df[col_name] = np.array(top_5_topics)[i].T
+    return df
+
+def clean_ff(ff_in):
+    ff_out = pd.DataFrame()
+    ff_out['Date'] = pd.to_datetime(ff_in['DATE'], infer_datetime_format=True)
+    ff_out['FedFundsRate'] = ff_in['FEDFUNDS']
+    ff_out.set_index('Date', drop=True, inplace=True)
+    return ff_out
+
+def clean_gdp(gdp_in):
+    gdp_out = pd.DataFrame()
+    gdp_out['Date'] = pd.to_datetime(gdp_in['DATE'], infer_datetime_format=True)
+    gdp_out['GDP'] = gdp_in['GDPC1']
+    gdp_out.set_index('Date', drop=True, inplace=True)
+    return gdp_out
+
+def grid_search_SARIMA(timeseries):
+    stepwise_model = auto_arima(timeseries, start_p=1, start_q=1,
+                           max_p=3, max_q=3, m=12,
+                           start_P=0, seasonal=True,
+                           d=1, D=1, trace=True,
+                           error_action='ignore',  
+                           suppress_warnings=True, 
+                           stepwise=True)
+    print(stepwise_model.aic())
+    return stepwise_model
+
+def plot_resid_SARIMA(arima_model, gdp):
+    try:
+        residuals = arima_model.resid()
+    except:
+        residuals = arima_model.resid
+    # dates=gdp.index[len(gdp)-len(residuals):]
+    dates = gdp.index
+    df = pd.DataFrame(data=residuals,index=dates,columns=['residuals'])
+    df.plot(figsize=(12,6), grid=True, legend=None)
+    plt.title('ARMA Fit Residual Error Line Plot')
+    plt.show()
+
+    df.plot(kind='kde', figsize=(12,6), grid=True, legend=None)
+    plt.title('ARMA Fit Residual Error Density Plot')
+    plt.show()
+    print(df.describe())
+    
+def one_ste_ahead_forecast(arima_model, timeseries, start_yr, forecast_start):
+    pred = arima_model.get_prediction(start=pd.to_datetime(forecast_start), dynamic=False)
+    pred_ci = pred.conf_int()
+
+    # plot
+    ax = timeseries[start_yr:].plot(label='observed', figsize=(15,10), logy=False)
+    pred.predicted_mean.plot(ax=ax, label='One-step ahead Forecast', alpha=.7)
+
+    ax.fill_between(pred_ci.index,
+                    pred_ci.iloc[:, 0],
+                    pred_ci.iloc[:, 1], color='k', alpha=.2)
+
+    ax.set_xlabel('Date')
+    ax.set_ylabel('GDP')
+    plt.legend()
+    plt.show()
+    
+def dynamic_forecast(arima_model, timeseries, start_yr, forecast_start):
+    pred_dynamic = arima_model.get_prediction(start=pd.to_datetime(forecast_start), dynamic=True, full_results=True)
+    pred_dynamic_ci = pred_dynamic.conf_int()
+
+    # plot
+    ax = timeseries[start_yr:].plot(label='observed', figsize=(15, 10))
+    pred_dynamic.predicted_mean.plot(label='Dynamic Forecast', ax=ax)
+
+    ax.fill_between(pred_dynamic_ci.index,
+                    pred_dynamic_ci.iloc[:, 0],
+                    pred_dynamic_ci.iloc[:, 1], color='k', alpha=.25)
+
+    ax.fill_betweenx(ax.get_ylim(), pd.to_datetime(forecast_start), timeseries.index[-1],
+                     alpha=.1, zorder=-1)
+
+    ax.set_xlabel('Date')
+    ax.set_ylabel('GDP')
+
+    plt.legend()
+    plt.show()
+    
+def validate_topics(docs, top_words,top_topic_num, NLP_algo, random_topic_num = np.random.randint(0,100)):
+    random_topic = docs[docs['Top #{} topic ({})'.format(top_topic_num, NLP_algo)] == random_topic_num]
+    print('Random Topic #: ',random_topic_num)
+    print('Top words in topic: ', top_words.iloc[random_topic_num].tolist())
+    print()
+    print('Article 1:')
+    print(random_topic['Content'].iloc[np.random.randint(0,random_topic.shape[0])])
+    print()
+    print('Article 2:')
+    print(random_topic['Content'].iloc[np.random.randint(0,random_topic.shape[0])])
+    print()
+    print('Article 3:')
+    print(random_topic['Content'].iloc[np.random.randint(0,random_topic.shape[0])])
