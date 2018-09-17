@@ -16,8 +16,14 @@ import re
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.decomposition import NMF, LatentDirichletAllocation
 
-from textblob import TextBlob, Blobber
-from textblob.sentiments import NaiveBayesAnalyzer
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.stattools import adfuller
+from sklearn.model_selection import cross_val_score
+from sklearn import metrics
+
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+analyser = SentimentIntensityAnalyzer()
+
 
 from pyramid.arima import auto_arima, ARIMA
 
@@ -75,7 +81,7 @@ class Model:
         self.y_prob = None
         self.alg = None
 
-    def modelfit(self, alg, dtrain, predictors, performCV=True, printFeatureImportance=True, cv_folds=5):
+    def modelfit(self, alg, dtrain, predictors, target, performCV=True, printFeatureImportance=True, cv_folds=5):
         #Fit the algorithm on the data
         alg.fit(dtrain[predictors], dtrain[target])
         self.alg = alg
@@ -100,7 +106,7 @@ class Model:
 
         #Print Feature Importance:
         if printFeatureImportance:
-            feat_imp = pd.Series(alg.feature_importances_, predictors).sort_values(ascending=False)
+            feat_imp = pd.Series(alg.feature_importances_, predictors).sort_values(ascending=False)[:10]
             feat_imp.plot(kind='bar', title='Feature Importances')
             plt.ylabel('Feature Importance Score')
             
@@ -296,8 +302,8 @@ def scree_plot(ax, pca, n_components_to_plot=8, title=None):
         ax.set_title(title, fontsize=16)
         
 def get_sentiment(text):
-    tb = Blobber(text, analyzer=NaiveBayesAnalyzer())
-    return opinion.sentiment.p_pos, opinion.polarity, opinion.subjectivity
+    analyser = SentimentIntensityAnalyzer()
+    return list(analyser.polarity_scores(text).values())[-1]
 
 def add_top_5_topics(df, top_5_topics, NLP_algo_name):
     '''
@@ -322,10 +328,10 @@ def clean_gdp(gdp_in):
     gdp_out.set_index('Date', drop=True, inplace=True)
     return gdp_out
 
-def grid_search_SARIMA(timeseries):
-    stepwise_model = auto_arima(timeseries, start_p=1, start_q=1,
+def grid_search_SARIMA(timeseries, exog=None):
+    stepwise_model = auto_arima(timeseries, exog, start_p=1, start_q=1,
                            max_p=3, max_q=3, m=12,
-                           start_P=0, seasonal=True,
+                           start_P=0, seasonal=True, 
                            d=1, D=1, trace=True,
                            error_action='ignore',  
                            suppress_warnings=True, 
@@ -333,7 +339,7 @@ def grid_search_SARIMA(timeseries):
     print(stepwise_model.aic())
     return stepwise_model
 
-def plot_resid_SARIMA(arima_model, gdp):
+def plot_resid(arima_model, gdp):
     try:
         residuals = arima_model.resid()
     except:
@@ -350,8 +356,8 @@ def plot_resid_SARIMA(arima_model, gdp):
     plt.show()
     print(df.describe())
     
-def one_ste_ahead_forecast(arima_model, timeseries, start_yr, forecast_start):
-    pred = arima_model.get_prediction(start=pd.to_datetime(forecast_start), dynamic=False)
+def one_step_ahead_forecast(arima_model, timeseries, start_yr, num_periods):
+    pred = arima_model.predict(num_periods)
     pred_ci = pred.conf_int()
 
     # plot
@@ -410,3 +416,92 @@ def norm_pdf(y):
     np.random.seed(12)
     norm_pdf = scipy.stats.norm.pdf(x, mu, sigma)
     return norm_pdf    
+
+def build_topic_df(docs, top_topic):
+    '''
+    Pass in a `docs` pd.DataFrame complete with `Top topics` and `Sentiment` and this will return a pd.DataFrame with
+    `Date`, `Topic ID`, `Sentiment` and most importantly, it will retunr the original document `index` so you can
+    easily retrieve the record by `index`.
+    '''
+    topic_df_list = []
+    for topic_id in docs[top_topic].drop_duplicates():
+        topic_id_df = docs[docs[top_topic] == topic_id][[top_topic,'Sentiment']].reset_index()
+        topic_id_df.rename(columns = {top_topic: 'Topic ID'}, inplace=True)
+        topic_df_list.append(topic_id_df)
+    topic_df = pd.concat(topic_df_list, axis=0)
+    
+    # pivot
+    topic_df_pivot = topic_df.pivot(index='index', columns='Topic ID', values='Sentiment')
+    topic_df_pivot.insert(0, 'Date', pd.to_datetime(docs['Date']))
+    return topic_df_pivot
+
+def gdp_change(gdp):
+    change_gdp = gdp['GDP'].iloc[1:].values/gdp['GDP'].iloc[:-1].values - 1
+    gdp['%Change'] = np.insert(change_gdp, 0, np.nan, axis=0)
+    return gdp
+
+def aggregate_sentiment(gdp, sentiment):
+    '''
+    This function aggregates sentiment data by gdp reporting periods.
+    '''
+    gdp_sentiment = pd.DataFrame()
+    gdp_sentiment['Period Start'], gdp_sentiment['Period End'] = gdp.index[:-1], gdp.index[1:]
+
+    # aggreagate topic sentiment and relative article count for each gdp reporting period
+    mean_sentiment = []
+    topic_count = []
+    for period in range(0,gdp_sentiment.shape[0]):
+        start_date = pd.to_datetime(gdp_sentiment.iloc[period]['Period Start'])
+        end_date = pd.to_datetime(gdp_sentiment.iloc[period]['Period End'] )  
+        dates = pd.to_datetime(sentiment['Date'])
+        bool_idx = (dates>=start_date) & (dates<end_date)
+        period_df = sentiment[bool_idx]
+        
+        # mean sentiment
+        if period_df.empty:
+            mean_sentiment_record = [np.nan] * 100
+            topic_count_record = [np.nan] * 100
+        else:
+            mean_sentiment_record = period_df.mean()[1:].values
+            topic_count_record = period_df.count()[2:].values/sum(period_df.count()[2:].values)
+            
+        mean_sentiment.append(mean_sentiment_record)
+        topic_count.append(topic_count_record)
+    
+    # generate column names
+    avg_topic_sentiment_names = []
+    topic_count_names = []
+    for n in range(0,100):
+        avg_topic_sentiment_names.append('Topic {} '.format(str(n)) + 'Avg. Sentiment')
+        topic_count_names.append('Topic {} '.format(str(n)) + 'Topic Count')
+
+    # build pd.DataFrame for topic sentiment and article count
+    topic_sentiment_df = pd.DataFrame(data=np.array(mean_sentiment), columns=avg_topic_sentiment_names)
+    topic_count_df = pd.DataFrame(data=np.array(topic_count), columns=topic_count_names)
+    return pd.concat([topic_sentiment_df,topic_count_df], axis=1)
+
+def test_stationarity(timeseries, label, window):
+    
+    #Determing rolling statistics
+    timeseries['rolmean'] = timeseries[label].rolling(window).mean()
+    timeseries['rolstd'] = timeseries[label].rolling(window).std()
+    
+    #Plot rolling statistics:
+    plot_multi(timeseries, 'Date', cols=None, spacing=.1, figsize=(10,8))
+    
+    plt.legend(loc='best')
+    plt.title('Rolling Mean & Standard Deviation')
+    plt.show(block=False)
+    
+    #Perform Dickey-Fuller test:
+    print('Results of Dickey-Fuller Test:')
+    dftest = adfuller(timeseries[label], autolag='AIC')
+    dfoutput = pd.Series(dftest[0:4], index=['Test Statistic','p-value','#Lags Used','Number of Observations Used'])
+    for key,value in dftest[4].items():
+        dfoutput['Critical Value (%s)'%key] = value
+    print(dfoutput)
+    
+def decompose_trend(df, label, model):
+    y = df[label]
+    print("Dickey–Fuller test: p=%f" % adfuller(y)[1])
+    _ = seasonal_decompose(y, model).plot()
